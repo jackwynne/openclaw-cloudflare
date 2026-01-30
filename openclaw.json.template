@@ -1,7 +1,7 @@
 {
   "agents": {
     "defaults": {
-      "workspace": "/root/clawd"
+      "workspace": "/root/openclaw"
     }
   },
   "gateway": {

@@ -28,17 +28,17 @@ RUN mkdir -p /root/.openclaw \
 
 # Copy startup script
 # Build cache bust: 2026-01-28-v26-browser-skill
-COPY start-moltbot.sh /usr/local/bin/start-moltbot.sh
-RUN chmod +x /usr/local/bin/start-moltbot.sh
+COPY start-openclaw.sh /usr/local/bin/start-openclaw.sh
+RUN chmod +x /usr/local/bin/start-openclaw.sh
 
 # Copy default configuration template
-COPY moltbot.json.template /root/.clawdbot-templates/moltbot.json.template
+COPY openclaw.json.template /root/.openclaw-templates/openclaw.json.template
 
 # Copy custom skills
-COPY skills/ /root/clawd/skills/
+COPY skills/ /root/openclaw/skills/
 
 # Set working directory
-WORKDIR /root/clawd
+WORKDIR /root/openclaw
 
 # Expose the gateway port
 EXPOSE 18789
