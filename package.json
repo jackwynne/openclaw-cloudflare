@@ -38,6 +38,13 @@
   },
   "author": "",
   "license": "MIT",
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "sharp",
+      "workerd"
+    ]
+  },
   "cloudflare": {
     "bindings": {
       "ANTHROPIC_API_KEY": {
