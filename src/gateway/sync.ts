@@ -19,10 +19,70 @@ function isDebugEnabled(env: OpenClawEnv): boolean {
   return env.DEBUG_ROUTES === 'true' || env.DEV_MODE === 'true';
 }
 
-function debugLog(env: OpenClawEnv, event: string, data?: Record<string, unknown>): void {
-  if (!isDebugEnabled(env)) return;
-  // Log as single-line JSON for Cloudflare log aggregation.
-  console.log(JSON.stringify({ msg: '[syncToR2]', event, ...data }));
+type SyncLogEvent = {
+  t: number; // elapsed ms
+  event: string;
+  data?: Record<string, unknown>;
+};
+
+function safeJsonStringify(x: unknown): string {
+  try {
+    return JSON.stringify(x);
+  } catch {
+    return '"[unserializable]"';
+  }
+}
+
+function sanitizeLogData(data?: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (!data) return undefined;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(data)) {
+    if (typeof v === 'string') out[k] = truncate(v, 2000);
+    else out[k] = v;
+  }
+  return out;
+}
+
+function createSyncLogger(env: OpenClawEnv): {
+  runId: string;
+  startedAt: number;
+  log: (event: string, data?: Record<string, unknown>) => void;
+  flushBundle: (finalResult?: SyncResult) => void;
+} {
+  const startedAt = Date.now();
+  const runId =
+    typeof globalThis.crypto?.randomUUID === 'function'
+      ? globalThis.crypto.randomUUID()
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  const events: SyncLogEvent[] = [];
+
+  const log = (event: string, data?: Record<string, unknown>): void => {
+    const t = Date.now() - startedAt;
+    const sanitized = sanitizeLogData({ runId, t, ...data });
+    events.push({ t, event, data: sanitizeLogData(data) });
+    if (!isDebugEnabled(env)) return;
+    console.log(safeJsonStringify({ msg: '[syncToR2]', event, ...sanitized }));
+  };
+
+  const flushBundle = (finalResult?: SyncResult): void => {
+    if (!isDebugEnabled(env)) return;
+    // Emit a single bundled line to make sharing logs easy.
+    // Keep it reasonably sized: cap events and truncate deeply nested fields.
+    const capped = events.slice(-60);
+    console.log(
+      safeJsonStringify({
+        msg: '[syncToR2]',
+        event: 'bundle',
+        runId,
+        durationMs: Date.now() - startedAt,
+        finalResult,
+        events: capped,
+      })
+    );
+  };
+
+  return { runId, startedAt, log, flushBundle };
 }
 
 function truncate(s: string, max: number): string {
@@ -31,7 +91,7 @@ function truncate(s: string, max: number): string {
 }
 
 async function bestEffortKill(
-  env: OpenClawEnv,
+  log: (event: string, data?: Record<string, unknown>) => void,
   proc: unknown,
   reason: string
 ): Promise<void> {
@@ -42,9 +102,9 @@ async function bestEffortKill(
     // Sandbox process methods are RPC-backed; calling `.call()` attempts to
     // invoke an RPC method named "call" (which doesn't exist).
     await (proc as { kill: () => Promise<void> }).kill();
-    debugLog(env, 'process_killed', { reason });
+    log('process_killed', { reason });
   } catch (err) {
-    debugLog(env, 'process_kill_error', {
+    log('process_kill_error', {
       reason,
       error: err instanceof Error ? err.message : String(err),
     });
@@ -67,14 +127,33 @@ async function checkForActiveRsync(sandbox: Sandbox, env: OpenClawEnv): Promise<
 
     const id = (active as unknown as { id?: string }).id;
     const command = (active as unknown as { command?: string }).command;
-    debugLog(env, 'rsync_already_running', { id, command: truncate(command || '', 500) });
+    // Keep using plain console for this one: it’s useful even when debug routes are off.
+    // Also: syncToR2 now emits a bundled line for easier sharing when debug is on.
+    if (isDebugEnabled(env)) {
+      console.log(
+        safeJsonStringify({
+          msg: '[syncToR2]',
+          event: 'rsync_already_running',
+          id,
+          command: truncate(command || '', 500),
+        })
+      );
+    }
     return {
       hasActive: true,
       details: `Skipped: another rsync appears to be running${id ? ` (id=${id})` : ''}.`,
     };
   } catch (err) {
     // If listProcesses fails, don't block sync; just log and proceed.
-    debugLog(env, 'rsync_check_error', { error: err instanceof Error ? err.message : String(err) });
+    if (isDebugEnabled(env)) {
+      console.log(
+        safeJsonStringify({
+          msg: '[syncToR2]',
+          event: 'rsync_check_error',
+          error: err instanceof Error ? err.message : String(err),
+        })
+      );
+    }
     return { hasActive: false };
   }
 }
@@ -90,7 +169,7 @@ function getProcessStatus(proc: unknown): string | undefined {
 }
 
 async function ensureRsyncSuccess(
-  env: OpenClawEnv,
+  log: (event: string, data?: Record<string, unknown>) => void,
   proc: unknown,
   which: 'openclaw' | 'workspace' | 'skills'
 ): Promise<SyncResult | undefined> {
@@ -100,7 +179,7 @@ async function ensureRsyncSuccess(
     const logs = await (proc as { getLogs?: () => Promise<{ stdout?: string; stderr?: string }> })
       .getLogs?.()
       .catch(() => ({ stdout: '', stderr: '' }));
-    debugLog(env, 'rsync_failed', {
+    log('rsync_failed', {
       which,
       status,
       exitCode,
@@ -131,12 +210,18 @@ async function ensureRsyncSuccess(
  * @returns SyncResult with success status and optional error details
  */
 export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<SyncResult> {
+  const logger = createSyncLogger(env);
+  const withBundle = (result: SyncResult): SyncResult => {
+    logger.flushBundle(result);
+    return result;
+  };
+
   // Check if R2 is configured
   if (!env.R2_ACCESS_KEY_ID || !env.R2_SECRET_ACCESS_KEY || !env.CF_ACCOUNT_ID) {
-    return { success: false, error: 'R2 storage is not configured' };
+    return withBundle({ success: false, error: 'R2 storage is not configured' });
   }
 
-  debugLog(env, 'start', {
+  logger.log('start', {
     r2MountPath: R2_MOUNT_PATH,
     hasR2AccessKeyId: !!env.R2_ACCESS_KEY_ID,
     hasR2SecretAccessKey: !!env.R2_SECRET_ACCESS_KEY,
@@ -146,16 +231,16 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
   // Mount R2 if not already mounted
   const mounted = await mountR2Storage(sandbox, env);
   if (!mounted) {
-    debugLog(env, 'mount_failed');
-    return { success: false, error: 'Failed to mount R2 storage' };
+    logger.log('mount_failed');
+    return withBundle({ success: false, error: 'Failed to mount R2 storage' });
   }
-  debugLog(env, 'mount_ok');
+  logger.log('mount_ok');
 
   // If an earlier cron run timed out, rsync may still be running in the container.
   // Avoid piling up multiple rsync processes.
   const activeRsync = await checkForActiveRsync(sandbox, env);
   if (activeRsync.hasActive) {
-    return { success: true, details: activeRsync.details };
+    return withBundle({ success: true, details: activeRsync.details });
   }
 
   // Sanity check: verify source has critical files before syncing
@@ -172,7 +257,7 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
       `if test -d "${R2_MOUNT_PATH}/workspace" && test -n "$(ls -A "${R2_MOUNT_PATH}/workspace" 2>/dev/null)"; then echo "__WORKSPACE_REMOTE_NONEMPTY__"; else echo "__WORKSPACE_REMOTE_EMPTY__"; fi` +
       `'`;
     const checkProc = await sandbox.startProcess(verifyCmd);
-    debugLog(env, 'verify_started', { cmd: verifyCmd, status: checkProc.status });
+    logger.log('verify_started', { cmd: verifyCmd, status: checkProc.status });
 
     // Best-effort wait: ignore timeouts and poll logs.
     await waitForProcess(checkProc, 10_000, 200).catch(() => {});
@@ -187,7 +272,7 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
       await new Promise((r) => setTimeout(r, 100));
     }
 
-    debugLog(env, 'verify_result', {
+    logger.log('verify_result', {
       status: checkProc.status,
       exitCode: (checkProc as unknown as { exitCode?: number }).exitCode,
       stdout: truncate(stdout.trim(), 500),
@@ -195,11 +280,11 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
     });
 
     if (stdout.includes('__MISSING__')) {
-      return { 
+      return withBundle({ 
         success: false, 
         error: 'Sync aborted: source missing openclaw.json',
         details: 'The local config directory is missing critical files. This could indicate corruption or an incomplete setup.',
-      };
+      });
     }
 
     // If we have a non-empty workspace backup, but the local workspace is empty,
@@ -208,13 +293,13 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
       stdout.includes('__WORKSPACE_REMOTE_NONEMPTY__') &&
       stdout.includes('__WORKSPACE_LOCAL_EMPTY__')
     ) {
-      return {
+      return withBundle({
         success: false,
         error: 'Sync aborted: local workspace appears empty',
         details:
           'The workspace directory is empty, but an existing workspace backup was found in R2. ' +
           'Aborting to avoid overwriting memory/bootstrap files with an empty workspace.',
-      };
+      });
     }
 
     if (!stdout.includes('__OK__')) {
@@ -223,12 +308,12 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
       );
     }
   } catch (err) {
-    debugLog(env, 'verify_error', { error: err instanceof Error ? err.message : String(err) });
-    return { 
+    logger.log('verify_error', { error: err instanceof Error ? err.message : String(err) });
+    return withBundle({ 
       success: false, 
       error: 'Failed to verify source files',
       details: err instanceof Error ? err.message : 'Unknown error',
-    };
+    });
   }
 
   // Run rsync to backup config to R2
@@ -249,75 +334,75 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
   const writeTimestampCmd = `sh -lc 'date -Iseconds > ${R2_MOUNT_PATH}/.last-sync'`;
   
   try {
-    debugLog(env, 'rsync_started', { cmd: syncOpenclawCmd });
+    logger.log('rsync_started', { cmd: syncOpenclawCmd });
     const proc = await sandbox.startProcess(syncOpenclawCmd);
-    debugLog(env, 'rsync_process', { status: proc.status });
+    logger.log('rsync_process', { status: proc.status });
 
     try {
       await waitForProcess(proc, DEFAULT_SYNC_TIMEOUT_MS);
     } catch (e) {
       // Include logs/status to help diagnose timeouts or stuck rsync.
       const logs = await proc.getLogs().catch(() => ({ stdout: '', stderr: '' }));
-      debugLog(env, 'rsync_wait_error', {
+      logger.log('rsync_wait_error', {
         error: e instanceof Error ? e.message : String(e),
         status: proc.status,
         exitCode: (proc as unknown as { exitCode?: number }).exitCode,
         stdout: truncate((logs.stdout || '').trim(), 2000),
         stderr: truncate((logs.stderr || '').trim(), 2000),
       });
-      await bestEffortKill(env, proc, 'rsync_openclaw_timeout');
+      await bestEffortKill(logger.log, proc, 'rsync_openclaw_timeout');
       throw e;
     }
-    debugLog(env, 'rsync_wait_done', {
+    logger.log('rsync_wait_done', {
       status: proc.status,
       exitCode: (proc as unknown as { exitCode?: number }).exitCode,
     });
-    const openclawResult = await ensureRsyncSuccess(env, proc, 'openclaw');
-    if (openclawResult) return openclawResult;
+    const openclawResult = await ensureRsyncSuccess(logger.log, proc, 'openclaw');
+    if (openclawResult) return withBundle(openclawResult);
 
-    debugLog(env, 'rsync_started', { cmd: syncWorkspaceCmd });
+    logger.log('rsync_started', { cmd: syncWorkspaceCmd });
     const workspaceProc = await sandbox.startProcess(syncWorkspaceCmd);
-    debugLog(env, 'rsync_process', { status: workspaceProc.status });
+    logger.log('rsync_process', { status: workspaceProc.status });
 
     try {
       await waitForProcess(workspaceProc, DEFAULT_SYNC_TIMEOUT_MS);
     } catch (e) {
       const logs = await workspaceProc.getLogs().catch(() => ({ stdout: '', stderr: '' }));
-      debugLog(env, 'rsync_wait_error', {
+      logger.log('rsync_wait_error', {
         error: e instanceof Error ? e.message : String(e),
         status: workspaceProc.status,
         exitCode: (workspaceProc as unknown as { exitCode?: number }).exitCode,
         stdout: truncate((logs.stdout || '').trim(), 2000),
         stderr: truncate((logs.stderr || '').trim(), 2000),
       });
-      await bestEffortKill(env, workspaceProc, 'rsync_workspace_timeout');
+      await bestEffortKill(logger.log, workspaceProc, 'rsync_workspace_timeout');
       throw e;
     }
-    const workspaceResult = await ensureRsyncSuccess(env, workspaceProc, 'workspace');
-    if (workspaceResult) return workspaceResult;
+    const workspaceResult = await ensureRsyncSuccess(logger.log, workspaceProc, 'workspace');
+    if (workspaceResult) return withBundle(workspaceResult);
 
-    debugLog(env, 'rsync_started', { cmd: syncSkillsCmd });
+    logger.log('rsync_started', { cmd: syncSkillsCmd });
     const skillsProc = await sandbox.startProcess(syncSkillsCmd);
-    debugLog(env, 'rsync_process', { status: skillsProc.status });
+    logger.log('rsync_process', { status: skillsProc.status });
 
     try {
       await waitForProcess(skillsProc, DEFAULT_SYNC_TIMEOUT_MS);
     } catch (e) {
       const logs = await skillsProc.getLogs().catch(() => ({ stdout: '', stderr: '' }));
-      debugLog(env, 'rsync_wait_error', {
+      logger.log('rsync_wait_error', {
         error: e instanceof Error ? e.message : String(e),
         status: skillsProc.status,
         exitCode: (skillsProc as unknown as { exitCode?: number }).exitCode,
         stdout: truncate((logs.stdout || '').trim(), 2000),
         stderr: truncate((logs.stderr || '').trim(), 2000),
       });
-      await bestEffortKill(env, skillsProc, 'rsync_skills_timeout');
+      await bestEffortKill(logger.log, skillsProc, 'rsync_skills_timeout');
       throw e;
     }
-    const skillsResult = await ensureRsyncSuccess(env, skillsProc, 'skills');
-    if (skillsResult) return skillsResult;
+    const skillsResult = await ensureRsyncSuccess(logger.log, skillsProc, 'skills');
+    if (skillsResult) return withBundle(skillsResult);
 
-    debugLog(env, 'timestamp_write_started', { cmd: writeTimestampCmd });
+    logger.log('timestamp_write_started', { cmd: writeTimestampCmd });
     const writeProc = await sandbox.startProcess(writeTimestampCmd);
     await waitForProcess(writeProc, 15000);
 
@@ -334,7 +419,7 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
     const out = timestampLogs.stdout?.trim();
     const lastSync = out && out !== '__MISSING__' ? out : undefined;
 
-    debugLog(env, 'timestamp_result', {
+    logger.log('timestamp_result', {
       status: timestampProc.status,
       exitCode: (timestampProc as unknown as { exitCode?: number }).exitCode,
       stdout: truncate((timestampLogs.stdout || '').trim(), 500),
@@ -342,7 +427,7 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
     });
     
     if (lastSync && lastSync.match(/^\d{4}-\d{2}-\d{2}/)) {
-      return { success: true, lastSync };
+      return withBundle({ success: true, lastSync });
     } else {
       const logs = await proc.getLogs();
       const diagProc = await sandbox.startProcess(
@@ -356,7 +441,7 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
       );
       await waitForProcess(diagProc, 5000, 200).catch(() => {});
       const diagLogs = await diagProc.getLogs().catch(() => ({ stdout: '', stderr: '' }));
-      debugLog(env, 'timestamp_missing_diag', {
+      logger.log('timestamp_missing_diag', {
         rsyncStatus: proc.status,
         rsyncExitCode: (proc as unknown as { exitCode?: number }).exitCode,
         rsyncStdout: truncate((logs.stdout || '').trim(), 2000),
@@ -364,7 +449,7 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
         diagStdout: truncate((diagLogs.stdout || '').trim(), 2000),
         diagStderr: truncate((diagLogs.stderr || '').trim(), 2000),
       });
-      return {
+      return withBundle({
         success: false,
         error: 'Sync failed',
         details: [
@@ -372,14 +457,14 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
           diagLogs.stdout?.trim(),
           diagLogs.stderr?.trim(),
         ].filter(Boolean).join('\n'),
-      };
+      });
     }
   } catch (err) {
-    debugLog(env, 'sync_error', { error: err instanceof Error ? err.message : String(err) });
-    return { 
+    logger.log('sync_error', { error: err instanceof Error ? err.message : String(err) });
+    return withBundle({ 
       success: false, 
       error: 'Sync error',
       details: err instanceof Error ? err.message : 'Unknown error',
-    };
+    });
   }
 }
