@@ -79,12 +79,13 @@ describe('syncToR2', () => {
     it('returns error when rsync fails (no timestamp created)', async () => {
       const { sandbox, startProcessMock } = createMockSandbox();
       
-      // Calls: mount check, sanity check, rsync (fails), cat timestamp (empty)
+      // Calls: mount check, sanity check, rsync (fails), timestamp wait (missing), diagnostics
       startProcessMock
         .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
         .mockResolvedValueOnce(createMockProcess('ok'))
         .mockResolvedValueOnce(createMockProcess('', { exitCode: 1 }))
-        .mockResolvedValueOnce(createMockProcess(''));
+        .mockResolvedValueOnce(createMockProcess('__MISSING__'))
+        .mockResolvedValueOnce(createMockProcess('[diag] mount:\n'));
       
       const env = createMockEnvWithR2();
 

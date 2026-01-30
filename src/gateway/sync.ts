@@ -59,28 +59,45 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
 
   // Run rsync to backup config to R2
   // Note: Use --no-times because s3fs doesn't support setting timestamps
-  const syncCmd = `rsync -r --no-times --delete --exclude='*.lock' --exclude='*.log' --exclude='*.tmp' /root/.openclaw/ ${R2_MOUNT_PATH}/openclaw/ && rsync -r --no-times --delete /root/clawd/skills/ ${R2_MOUNT_PATH}/skills/ && date -Iseconds > ${R2_MOUNT_PATH}/.last-sync`;
+  const syncCmd = `rsync -r --no-times --delete --exclude='*.lock' --exclude='*.log' --exclude='*.tmp' /root/.openclaw/ ${R2_MOUNT_PATH}/openclaw/ && rsync -r --no-times --delete /root/openclaw/skills/ ${R2_MOUNT_PATH}/skills/ && date -Iseconds > ${R2_MOUNT_PATH}/.last-sync`;
   
   try {
     const proc = await sandbox.startProcess(syncCmd);
-    await waitForProcess(proc, 30000); // 30 second timeout for sync
+    await waitForProcess(proc, 120000); // 2 minute timeout for sync (cron + large backups can take longer)
 
-    // Check for success by reading the timestamp file
-    // (process status may not update reliably in sandbox API)
+    // Check for success by reading the timestamp file.
+    // Do not rely on process status alone: status/logs can lag behind actual completion.
     // Note: backup structure is ${R2_MOUNT_PATH}/openclaw/ and ${R2_MOUNT_PATH}/skills/
-    const timestampProc = await sandbox.startProcess(`cat ${R2_MOUNT_PATH}/.last-sync`);
-    await waitForProcess(timestampProc, 5000);
+    const timestampProc = await sandbox.startProcess(
+      // Single process to avoid status/log race conditions and avoid spinning up many processes.
+      // Wait up to ~10 seconds for the marker to appear.
+      `sh -lc 'for i in $(seq 1 40); do if test -f "${R2_MOUNT_PATH}/.last-sync"; then cat "${R2_MOUNT_PATH}/.last-sync"; exit 0; fi; sleep 0.25; done; echo "__MISSING__"'`
+    );
+    await waitForProcess(timestampProc, 15000);
     const timestampLogs = await timestampProc.getLogs();
-    const lastSync = timestampLogs.stdout?.trim();
+    const out = timestampLogs.stdout?.trim();
+    const lastSync = out && out !== '__MISSING__' ? out : undefined;
     
     if (lastSync && lastSync.match(/^\d{4}-\d{2}-\d{2}/)) {
       return { success: true, lastSync };
     } else {
       const logs = await proc.getLogs();
+      const diagProc = await sandbox.startProcess(
+        `echo "[diag] mount:" && mount | grep s3fs || true; ` +
+        `echo "[diag] r2_path:" && ls -la ${R2_MOUNT_PATH} || true; ` +
+        `echo "[diag] openclaw_src:" && ls -la /root/.openclaw || true; ` +
+        `echo "[diag] skills_src:" && ls -la /root/openclaw/skills || true`
+      );
+      await waitForProcess(diagProc, 5000);
+      const diagLogs = await diagProc.getLogs();
       return {
         success: false,
         error: 'Sync failed',
-        details: logs.stderr || logs.stdout || 'No timestamp file created',
+        details: [
+          logs.stderr || logs.stdout || 'No timestamp file created',
+          diagLogs.stdout?.trim(),
+          diagLogs.stderr?.trim(),
+        ].filter(Boolean).join('\n'),
       };
     }
   } catch (err) {

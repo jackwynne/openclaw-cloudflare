@@ -1,6 +1,7 @@
 import type { Sandbox } from '@cloudflare/sandbox';
 import type { OpenClawEnv } from '../types';
 import { R2_MOUNT_PATH, R2_BUCKET_NAME } from '../config';
+import { waitForProcess } from './utils';
 
 /**
  * Check if R2 is already mounted by looking at the mount table
@@ -8,12 +9,7 @@ import { R2_MOUNT_PATH, R2_BUCKET_NAME } from '../config';
 async function isR2Mounted(sandbox: Sandbox): Promise<boolean> {
   try {
     const proc = await sandbox.startProcess(`mount | grep "s3fs on ${R2_MOUNT_PATH}"`);
-    // Wait for the command to complete
-    let attempts = 0;
-    while (proc.status === 'running' && attempts < 10) {
-      await new Promise(r => setTimeout(r, 200));
-      attempts++;
-    }
+    await waitForProcess(proc, 5000, 200);
     const logs = await proc.getLogs();
     // If stdout has content, the mount exists
     const mounted = !!(logs.stdout && logs.stdout.includes('s3fs'));

@@ -304,7 +304,7 @@ All endpoints require the `CDP_SECRET` header for authentication.
 
 ## Built-in Skills
 
-The container includes pre-installed skills in `/root/clawd/skills/`:
+The container includes pre-installed skills in `/root/openclaw/skills/`:
 
 ### cloudflare-browser
 
@@ -318,10 +318,10 @@ Browser automation via the CDP shim. Requires `CDP_SECRET` and `WORKER_URL` to b
 **Usage:**
 ```bash
 # Screenshot
-node /root/clawd/skills/cloudflare-browser/scripts/screenshot.js https://example.com output.png
+node /root/openclaw/skills/cloudflare-browser/scripts/screenshot.js https://example.com output.png
 
 # Video from multiple URLs
-node /root/clawd/skills/cloudflare-browser/scripts/video.js "https://site1.com,https://site2.com" output.mp4 --scroll
+node /root/openclaw/skills/cloudflare-browser/scripts/video.js "https://site1.com,https://site2.com" output.mp4 --scroll
 ```
 
 See `skills/cloudflare-browser/SKILL.md` for full documentation.

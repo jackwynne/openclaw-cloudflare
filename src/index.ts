@@ -399,7 +399,12 @@ async function scheduled(
   if (result.success) {
     console.log('[cron] Backup sync completed successfully at', result.lastSync);
   } else {
-    console.error('[cron] Backup sync failed:', result.error, result.details || '');
+    // Log as structured JSON so Cloudflare log aggregation doesn't drop multi-line details.
+    console.error(JSON.stringify({
+      msg: '[cron] Backup sync failed',
+      error: result.error,
+      details: result.details,
+    }));
   }
 }
 
