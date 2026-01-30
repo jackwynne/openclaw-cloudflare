@@ -14,12 +14,12 @@ RUN apt-get update && apt-get install -y xz-utils ca-certificates rsync \
 # Install pnpm globally
 RUN npm install -g pnpm
 
-# Install moltbot (CLI is still named clawdbot until upstream renames)
+# Install openclaw (CLI is still named clawdbot until upstream renames)
 # Pin to specific version for reproducible builds
 RUN npm install -g openclaw@latest \
     && openclaw --version
 
-# Create moltbot directories (paths still use clawdbot until upstream renames)
+# Create openclaw directories (paths still use clawdbot until upstream renames)
 # Templates are stored in /root/.clawdbot-templates for initialization
 RUN mkdir -p /root/.openclaw \
     && mkdir -p /root/.openclaw-templates \
