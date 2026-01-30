@@ -66,8 +66,8 @@ describe('mountR2Storage', () => {
   describe('mounting behavior', () => {
     it('mounts R2 bucket when credentials provided and not already mounted', async () => {
       const { sandbox, mountBucketMock, startProcessMock } = createMockSandbox({ mounted: false });
-      // isR2Mounted reads /proc/mounts; when not mounted it returns empty.
-      startProcessMock.mockResolvedValueOnce(createMockProcess(''));
+      // probeMount uses `stat -f -c %T`; a normal dir is e.g. overlayfs (not mounted).
+      startProcessMock.mockResolvedValueOnce(createMockProcess('overlayfs\n'));
       const env = createMockEnvWithR2({
         R2_ACCESS_KEY_ID: 'key123',
         R2_SECRET_ACCESS_KEY: 'secret',
@@ -92,10 +92,8 @@ describe('mountR2Storage', () => {
 
     it('returns true immediately when bucket is already mounted', async () => {
       const { sandbox, mountBucketMock, startProcessMock } = createMockSandbox({ mounted: true });
-      // isR2Mounted reads /proc/mounts, then we probe responsiveness.
-      startProcessMock
-        .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
-        .mockResolvedValueOnce(createMockProcess('__OK__'));
+      // probeMount sees a fuse filesystem type when mounted
+      startProcessMock.mockResolvedValueOnce(createMockProcess('fuse.s3fs\n'));
       const env = createMockEnvWithR2();
 
       const result = await mountR2Storage(sandbox, env);
@@ -104,14 +102,15 @@ describe('mountR2Storage', () => {
       expect(mountBucketMock).not.toHaveBeenCalled();
       expect(console.log).toHaveBeenCalledWith(
         'R2 bucket already mounted at',
-        '/data/openclaw'
+        '/data/openclaw',
+        '(fsType:',
+        'fuse.s3fs)'
       );
     });
 
     it('logs success message when mounted successfully', async () => {
       const { sandbox, startProcessMock } = createMockSandbox({ mounted: false });
-      // isR2Mounted reads /proc/mounts; when not mounted it returns empty.
-      startProcessMock.mockResolvedValueOnce(createMockProcess(''));
+      startProcessMock.mockResolvedValueOnce(createMockProcess('overlayfs\n'));
       const env = createMockEnvWithR2();
 
       await mountR2Storage(sandbox, env);
@@ -127,8 +126,7 @@ describe('mountR2Storage', () => {
       const { sandbox, mountBucketMock, startProcessMock } = createMockSandbox({ mounted: false });
       mountBucketMock.mockRejectedValue(new Error('Mount failed'));
       startProcessMock
-        .mockResolvedValueOnce(createMockProcess(''))
-        .mockResolvedValueOnce(createMockProcess(''));
+        .mockResolvedValueOnce(createMockProcess('overlayfs\n'));
       
       const env = createMockEnvWithR2();
 
@@ -141,21 +139,28 @@ describe('mountR2Storage', () => {
       );
     });
 
-    it('returns true if mount fails but check shows it is actually mounted', async () => {
+    it('returns true if mount fails with "path in use" and probe shows it is mounted', async () => {
       const { sandbox, mountBucketMock, startProcessMock } = createMockSandbox();
+      // Initial probe says not mounted, then mountBucket throws "path in use", then probe says mounted.
       startProcessMock
-        .mockResolvedValueOnce(createMockProcess(''))
-        .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
-        .mockResolvedValueOnce(createMockProcess('__OK__')); // mount probe
+        .mockResolvedValueOnce(createMockProcess('overlayfs\n'))
+        .mockResolvedValueOnce(createMockProcess('fuse.s3fs\n'));
       
-      mountBucketMock.mockRejectedValue(new Error('Transient error'));
+      mountBucketMock.mockRejectedValue(
+        new Error(
+          'InvalidMountConfigError: Mount path "/data/openclaw" is already in use by bucket "openclaw-data".'
+        )
+      );
       
       const env = createMockEnvWithR2();
 
       const result = await mountR2Storage(sandbox, env);
 
       expect(result).toBe(true);
-      expect(console.log).toHaveBeenCalledWith('R2 bucket is mounted despite error');
+      expect(console.log).toHaveBeenCalledWith(
+        'R2 mount path is in use and appears mounted (fsType:',
+        'fuse.s3fs)'
+      );
     });
   });
 });

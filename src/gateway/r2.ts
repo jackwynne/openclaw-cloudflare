@@ -3,17 +3,34 @@ import type { OpenClawEnv } from '../types';
 import { R2_MOUNT_PATH, R2_BUCKET_NAME } from '../config';
 import { waitForProcess } from './utils';
 
-async function probeMountResponsive(sandbox: Sandbox): Promise<boolean> {
-  // If the s3fs mount is stale/unresponsive, simple filesystem calls can hang
-  // indefinitely. Use a short worker-side timeout to detect this.
-  const proc = await sandbox.startProcess(`sh -lc 'ls -la "${R2_MOUNT_PATH}" >/dev/null 2>&1; echo "__OK__"'`);
+type MountProbe =
+  | { state: 'mounted'; fsType: string }
+  | { state: 'not_mounted'; fsType: string }
+  | { state: 'unresponsive' };
+
+async function probeMount(sandbox: Sandbox): Promise<MountProbe> {
+  // Use filesystem type instead of /proc/mounts parsing. In Cloudflare Sandbox,
+  // mountBucket() can report "path in use" even when /proc/mounts doesn't show
+  // an obvious s3fs entry.
+  //
+  // Also: if the mount is stale/unresponsive, stat can hang. Treat that as
+  // unresponsive and trigger a remount attempt.
+  const proc = await sandbox.startProcess(
+    `sh -lc 'stat -f -c %T "${R2_MOUNT_PATH}" 2>/dev/null || echo "__ERR__"'`
+  );
   try {
     await waitForProcess(proc, 5000, 200);
   } catch {
-    return false;
+    return { state: 'unresponsive' };
   }
+
   const logs = await proc.getLogs().catch(() => ({ stdout: '', stderr: '' }));
-  return (logs.stdout || '').includes('__OK__');
+  const fsType = (logs.stdout || '').trim().split(/\s+/)[0] || '';
+  if (!fsType || fsType === '__ERR__') return { state: 'not_mounted', fsType: fsType || '__ERR__' };
+
+  // When mounted via mountBucket, this is typically a fuse filesystem.
+  if (fsType.startsWith('fuse')) return { state: 'mounted', fsType };
+  return { state: 'not_mounted', fsType };
 }
 
 async function lazyUnmountR2(sandbox: Sandbox): Promise<void> {
@@ -29,42 +46,12 @@ async function lazyUnmountR2(sandbox: Sandbox): Promise<void> {
   await waitForProcess(proc, 5000, 200).catch(() => {});
 }
 
-/**
- * Check if R2 is already mounted by looking at the mount table.
- *
- * Important: sandbox process status can lag behind actual completion, so we
- * must not treat a `running` status as authoritative for small commands.
- */
-async function isR2Mounted(sandbox: Sandbox): Promise<boolean> {
-  try {
-    // Prefer /proc/mounts: stable format and no shell needed.
-    const proc = await sandbox.startProcess('cat /proc/mounts');
-
-    // Best-effort wait: status may lag, so ignore timeouts.
-    await waitForProcess(proc, 5000, 200).catch(() => {});
-
-    // Poll logs briefly in case status/logs lag behind each other.
-    let stdout = '';
-    for (let i = 0; i < 10; i++) {
-      const logs = await proc.getLogs().catch(() => ({ stdout: '', stderr: '' }));
-      stdout = logs.stdout || '';
-      if (stdout.trim().length > 0) break;
-      await new Promise((r) => setTimeout(r, 100));
-    }
-
-    const lines = stdout.split('\n');
-    // `mount` output uses "on <path>", /proc/mounts uses "<path>".
-    const mounted = lines.some((line) => {
-      if (!line.includes('s3fs')) return false;
-      return line.includes(` ${R2_MOUNT_PATH} `) || line.includes(` on ${R2_MOUNT_PATH} `);
-    });
-
-    console.log('isR2Mounted check:', mounted);
-    return mounted;
-  } catch (err) {
-    console.log('isR2Mounted error:', err);
-    return false;
-  }
+function isMountPathInUseError(errorMessage: string): boolean {
+  return (
+    errorMessage.includes('InvalidMountConfigError') &&
+    errorMessage.includes('Mount path') &&
+    errorMessage.includes('already in use')
+  );
 }
 
 /**
@@ -81,18 +68,17 @@ export async function mountR2Storage(sandbox: Sandbox, env: OpenClawEnv): Promis
     return false;
   }
 
-  // Check if already mounted first - this avoids errors and is faster
-  if (await isR2Mounted(sandbox)) {
-    // Being "mounted" doesn't mean it's responsive. s3fs mounts can become stale
-    // and cause filesystem operations to hang.
-    const responsive = await probeMountResponsive(sandbox);
-    if (responsive) {
-      console.log('R2 bucket already mounted at', R2_MOUNT_PATH);
-      return true;
-    }
-
-    console.log('R2 bucket mount appears unresponsive, attempting remount at', R2_MOUNT_PATH);
+  // Check mount state up front. This is both faster and avoids InvalidMountConfigError.
+  const initialProbe = await probeMount(sandbox);
+  if (initialProbe.state === 'mounted') {
+    console.log('R2 bucket already mounted at', R2_MOUNT_PATH, '(fsType:', initialProbe.fsType + ')');
+    return true;
+  }
+  if (initialProbe.state === 'unresponsive') {
+    console.log('R2 mount appears unresponsive, attempting remount at', R2_MOUNT_PATH);
     await lazyUnmountR2(sandbox);
+  } else {
+    console.log('R2 mount not detected at', R2_MOUNT_PATH, '(fsType:', initialProbe.fsType + ')');
   }
 
   try {
@@ -110,16 +96,32 @@ export async function mountR2Storage(sandbox: Sandbox, env: OpenClawEnv): Promis
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);
     console.log('R2 mount error:', errorMessage);
-    
-    // Check again if it's mounted - the error might be misleading
-    if (await isR2Mounted(sandbox)) {
-      // Only accept it as "ok" if the mount is responsive.
-      const responsive = await probeMountResponsive(sandbox);
-      if (responsive) {
-        console.log('R2 bucket is mounted despite error');
+
+    // If the platform reports "path already in use", treat it as already-mounted
+    // unless the mount is unresponsive.
+    if (isMountPathInUseError(errorMessage)) {
+      const probe = await probeMount(sandbox);
+      if (probe.state === 'mounted') {
+        console.log('R2 mount path is in use and appears mounted (fsType:', probe.fsType + ')');
         return true;
       }
-      console.log('R2 bucket is mounted but unresponsive after error');
+      if (probe.state === 'unresponsive') {
+        console.log('R2 mount path is in use but unresponsive; attempting remount at', R2_MOUNT_PATH);
+        await lazyUnmountR2(sandbox);
+        try {
+          await sandbox.mountBucket(R2_BUCKET_NAME, R2_MOUNT_PATH, {
+            endpoint: `https://${env.CF_ACCOUNT_ID}.r2.cloudflarestorage.com`,
+            credentials: {
+              accessKeyId: env.R2_ACCESS_KEY_ID,
+              secretAccessKey: env.R2_SECRET_ACCESS_KEY,
+            },
+          });
+          console.log('R2 bucket mounted successfully after remount attempt');
+          return true;
+        } catch (retryErr) {
+          console.log('R2 remount error:', retryErr instanceof Error ? retryErr.message : String(retryErr));
+        }
+      }
     }
     
     // Don't fail if mounting fails - openclaw can still run without persistent storage
