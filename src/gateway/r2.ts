@@ -3,6 +3,32 @@ import type { OpenClawEnv } from '../types';
 import { R2_MOUNT_PATH, R2_BUCKET_NAME } from '../config';
 import { waitForProcess } from './utils';
 
+async function probeMountResponsive(sandbox: Sandbox): Promise<boolean> {
+  // If the s3fs mount is stale/unresponsive, simple filesystem calls can hang
+  // indefinitely. Use a short worker-side timeout to detect this.
+  const proc = await sandbox.startProcess(`sh -lc 'ls -la "${R2_MOUNT_PATH}" >/dev/null 2>&1; echo "__OK__"'`);
+  try {
+    await waitForProcess(proc, 5000, 200);
+  } catch {
+    return false;
+  }
+  const logs = await proc.getLogs().catch(() => ({ stdout: '', stderr: '' }));
+  return (logs.stdout || '').includes('__OK__');
+}
+
+async function lazyUnmountR2(sandbox: Sandbox): Promise<void> {
+  // Try a lazy unmount first. This avoids blocking if the mount is hung.
+  // Not all images have fusermount(3), so attempt umount first.
+  const cmd =
+    `sh -lc ` +
+    `"umount -l '${R2_MOUNT_PATH}' 2>/dev/null || ` +
+    `fusermount -uz '${R2_MOUNT_PATH}' 2>/dev/null || ` +
+    `fusermount -u '${R2_MOUNT_PATH}' 2>/dev/null || true"`;
+  const proc = await sandbox.startProcess(cmd);
+  // Best-effort wait: if unmount hangs, we'll just continue and rely on mountBucket errors.
+  await waitForProcess(proc, 5000, 200).catch(() => {});
+}
+
 /**
  * Check if R2 is already mounted by looking at the mount table.
  *
@@ -57,8 +83,16 @@ export async function mountR2Storage(sandbox: Sandbox, env: OpenClawEnv): Promis
 
   // Check if already mounted first - this avoids errors and is faster
   if (await isR2Mounted(sandbox)) {
-    console.log('R2 bucket already mounted at', R2_MOUNT_PATH);
-    return true;
+    // Being "mounted" doesn't mean it's responsive. s3fs mounts can become stale
+    // and cause filesystem operations to hang.
+    const responsive = await probeMountResponsive(sandbox);
+    if (responsive) {
+      console.log('R2 bucket already mounted at', R2_MOUNT_PATH);
+      return true;
+    }
+
+    console.log('R2 bucket mount appears unresponsive, attempting remount at', R2_MOUNT_PATH);
+    await lazyUnmountR2(sandbox);
   }
 
   try {
@@ -79,8 +113,13 @@ export async function mountR2Storage(sandbox: Sandbox, env: OpenClawEnv): Promis
     
     // Check again if it's mounted - the error might be misleading
     if (await isR2Mounted(sandbox)) {
-      console.log('R2 bucket is mounted despite error');
-      return true;
+      // Only accept it as "ok" if the mount is responsive.
+      const responsive = await probeMountResponsive(sandbox);
+      if (responsive) {
+        console.log('R2 bucket is mounted despite error');
+        return true;
+      }
+      console.log('R2 bucket is mounted but unresponsive after error');
     }
     
     // Don't fail if mounting fails - openclaw can still run without persistent storage

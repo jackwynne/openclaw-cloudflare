@@ -35,10 +35,13 @@ async function bestEffortKill(
   proc: unknown,
   reason: string
 ): Promise<void> {
-  const maybeKill = (proc as { kill?: () => Promise<void> }).kill;
-  if (!maybeKill) return;
+  const maybeKill = (proc as { kill?: unknown }).kill;
+  if (typeof maybeKill !== 'function') return;
   try {
-    await maybeKill.call(proc);
+    // Important: do NOT use Function.prototype.call/apply here.
+    // Sandbox process methods are RPC-backed; calling `.call()` attempts to
+    // invoke an RPC method named "call" (which doesn't exist).
+    await (proc as { kill: () => Promise<void> }).kill();
     debugLog(env, 'process_killed', { reason });
   } catch (err) {
     debugLog(env, 'process_kill_error', {
@@ -76,29 +79,42 @@ async function checkForActiveRsync(sandbox: Sandbox, env: OpenClawEnv): Promise<
   }
 }
 
-async function checkMountResponsive(sandbox: Sandbox, env: OpenClawEnv): Promise<boolean> {
-  // A mounted s3fs filesystem can still be "hung" (I/O stalls). This fast check
-  // helps distinguish "slow sync" vs "stuck mount".
-  const cmd = `sh -lc 'ls -la ${R2_MOUNT_PATH} >/dev/null 2>&1; echo "__OK__"'`;
-  const proc = await sandbox.startProcess(cmd);
-  debugLog(env, 'mount_probe_started', { cmd });
+function getProcessExitCode(proc: unknown): number | undefined {
+  const exitCode = (proc as { exitCode?: unknown }).exitCode;
+  return typeof exitCode === 'number' ? exitCode : undefined;
+}
 
-  try {
-    await waitForProcess(proc, 5000, 200);
-  } catch (err) {
-    debugLog(env, 'mount_probe_timeout', { error: err instanceof Error ? err.message : String(err) });
-    await bestEffortKill(env, proc, 'mount_probe_timeout');
-    return false;
+function getProcessStatus(proc: unknown): string | undefined {
+  const status = (proc as { status?: unknown }).status;
+  return typeof status === 'string' ? status : undefined;
+}
+
+async function ensureRsyncSuccess(
+  env: OpenClawEnv,
+  proc: unknown,
+  which: 'openclaw' | 'workspace' | 'skills'
+): Promise<SyncResult | undefined> {
+  const status = getProcessStatus(proc);
+  const exitCode = getProcessExitCode(proc);
+  if (status === 'failed' || (typeof exitCode === 'number' && exitCode !== 0)) {
+    const logs = await (proc as { getLogs?: () => Promise<{ stdout?: string; stderr?: string }> })
+      .getLogs?.()
+      .catch(() => ({ stdout: '', stderr: '' }));
+    debugLog(env, 'rsync_failed', {
+      which,
+      status,
+      exitCode,
+      stdout: truncate((logs?.stdout || '').trim(), 2000),
+      stderr: truncate((logs?.stderr || '').trim(), 2000),
+    });
+    return {
+      success: false,
+      error: 'Sync failed',
+      details:
+        (logs?.stderr || logs?.stdout || `rsync failed (${which}) exitCode=${exitCode ?? 'unknown'}`).trim(),
+    };
   }
-
-  const logs = await proc.getLogs().catch(() => ({ stdout: '', stderr: '' }));
-  const ok = (logs.stdout || '').includes('__OK__');
-  debugLog(env, 'mount_probe_result', {
-    stdout: truncate((logs.stdout || '').trim(), 500),
-    stderr: truncate((logs.stderr || '').trim(), 500),
-    ok,
-  });
-  return ok;
+  return undefined;
 }
 
 /**
@@ -140,16 +156,6 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
   const activeRsync = await checkForActiveRsync(sandbox, env);
   if (activeRsync.hasActive) {
     return { success: true, details: activeRsync.details };
-  }
-
-  // Verify the mount is responsive before starting a potentially long rsync.
-  const mountResponsive = await checkMountResponsive(sandbox, env);
-  if (!mountResponsive) {
-    return {
-      success: false,
-      error: 'R2 mount appears unresponsive',
-      details: `A simple 'ls' against ${R2_MOUNT_PATH} did not complete quickly. This often indicates the s3fs mount is hung or severely degraded.`,
-    };
   }
 
   // Sanity check: verify source has critical files before syncing
@@ -266,6 +272,8 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
       status: proc.status,
       exitCode: (proc as unknown as { exitCode?: number }).exitCode,
     });
+    const openclawResult = await ensureRsyncSuccess(env, proc, 'openclaw');
+    if (openclawResult) return openclawResult;
 
     debugLog(env, 'rsync_started', { cmd: syncWorkspaceCmd });
     const workspaceProc = await sandbox.startProcess(syncWorkspaceCmd);
@@ -285,6 +293,8 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
       await bestEffortKill(env, workspaceProc, 'rsync_workspace_timeout');
       throw e;
     }
+    const workspaceResult = await ensureRsyncSuccess(env, workspaceProc, 'workspace');
+    if (workspaceResult) return workspaceResult;
 
     debugLog(env, 'rsync_started', { cmd: syncSkillsCmd });
     const skillsProc = await sandbox.startProcess(syncSkillsCmd);
@@ -304,6 +314,8 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
       await bestEffortKill(env, skillsProc, 'rsync_skills_timeout');
       throw e;
     }
+    const skillsResult = await ensureRsyncSuccess(env, skillsProc, 'skills');
+    if (skillsResult) return skillsResult;
 
     debugLog(env, 'timestamp_write_started', { cmd: writeTimestampCmd });
     const writeProc = await sandbox.startProcess(writeTimestampCmd);

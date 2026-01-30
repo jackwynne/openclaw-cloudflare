@@ -65,7 +65,9 @@ describe('mountR2Storage', () => {
 
   describe('mounting behavior', () => {
     it('mounts R2 bucket when credentials provided and not already mounted', async () => {
-      const { sandbox, mountBucketMock } = createMockSandbox({ mounted: false });
+      const { sandbox, mountBucketMock, startProcessMock } = createMockSandbox({ mounted: false });
+      // isR2Mounted reads /proc/mounts; when not mounted it returns empty.
+      startProcessMock.mockResolvedValueOnce(createMockProcess(''));
       const env = createMockEnvWithR2({
         R2_ACCESS_KEY_ID: 'key123',
         R2_SECRET_ACCESS_KEY: 'secret',
@@ -89,7 +91,11 @@ describe('mountR2Storage', () => {
     });
 
     it('returns true immediately when bucket is already mounted', async () => {
-      const { sandbox, mountBucketMock } = createMockSandbox({ mounted: true });
+      const { sandbox, mountBucketMock, startProcessMock } = createMockSandbox({ mounted: true });
+      // isR2Mounted reads /proc/mounts, then we probe responsiveness.
+      startProcessMock
+        .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
+        .mockResolvedValueOnce(createMockProcess('__OK__'));
       const env = createMockEnvWithR2();
 
       const result = await mountR2Storage(sandbox, env);
@@ -103,7 +109,9 @@ describe('mountR2Storage', () => {
     });
 
     it('logs success message when mounted successfully', async () => {
-      const { sandbox } = createMockSandbox({ mounted: false });
+      const { sandbox, startProcessMock } = createMockSandbox({ mounted: false });
+      // isR2Mounted reads /proc/mounts; when not mounted it returns empty.
+      startProcessMock.mockResolvedValueOnce(createMockProcess(''));
       const env = createMockEnvWithR2();
 
       await mountR2Storage(sandbox, env);
@@ -137,7 +145,8 @@ describe('mountR2Storage', () => {
       const { sandbox, mountBucketMock, startProcessMock } = createMockSandbox();
       startProcessMock
         .mockResolvedValueOnce(createMockProcess(''))
-        .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'));
+        .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
+        .mockResolvedValueOnce(createMockProcess('__OK__')); // mount probe
       
       mountBucketMock.mockRejectedValue(new Error('Transient error'));
       

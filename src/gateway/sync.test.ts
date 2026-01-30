@@ -43,7 +43,7 @@ describe('syncToR2', () => {
       const { sandbox, startProcessMock } = createMockSandbox();
       startProcessMock
         .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
-        .mockResolvedValueOnce(createMockProcess('__OK__')) // mount probe
+        .mockResolvedValueOnce(createMockProcess('__OK__')) // r2 mount probe (inside mountR2Storage)
         .mockResolvedValueOnce(createMockProcess('__MISSING__')); // Missing marker output
       
       const env = createMockEnvWithR2();
@@ -62,11 +62,20 @@ describe('syncToR2', () => {
       const { sandbox, startProcessMock } = createMockSandbox();
       const timestamp = '2026-01-27T12:00:00+00:00';
       
-      // Calls: mount check, mount probe, sanity check, rsync openclaw, rsync skills, write timestamp, cat timestamp
+      // Calls:
+      // 1) isR2Mounted (cat /proc/mounts)
+      // 2) r2 mount probe (ls)
+      // 3) verify
+      // 4) rsync openclaw
+      // 5) rsync workspace
+      // 6) rsync skills
+      // 7) write timestamp
+      // 8) read timestamp
       startProcessMock
         .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
         .mockResolvedValueOnce(createMockProcess('__OK__'))
         .mockResolvedValueOnce(createMockProcess('__OK__'))
+        .mockResolvedValueOnce(createMockProcess(''))
         .mockResolvedValueOnce(createMockProcess(''))
         .mockResolvedValueOnce(createMockProcess(''))
         .mockResolvedValueOnce(createMockProcess(''))
@@ -83,14 +92,12 @@ describe('syncToR2', () => {
     it('returns error when rsync fails (no timestamp created)', async () => {
       const { sandbox, startProcessMock } = createMockSandbox();
       
-      // Calls: mount check, mount probe, sanity check, rsync openclaw (fails), timestamp wait (missing), diagnostics
+      // Calls: isR2Mounted, r2 mount probe, verify, rsync openclaw (fails)
       startProcessMock
         .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
         .mockResolvedValueOnce(createMockProcess('__OK__'))
         .mockResolvedValueOnce(createMockProcess('__OK__'))
-        .mockResolvedValueOnce(createMockProcess('', { exitCode: 1 }))
-        .mockResolvedValueOnce(createMockProcess('__MISSING__'))
-        .mockResolvedValueOnce(createMockProcess('[diag] mount:\n'));
+        .mockResolvedValueOnce(createMockProcess('', { exitCode: 1 }));
       
       const env = createMockEnvWithR2();
 
@@ -106,8 +113,9 @@ describe('syncToR2', () => {
       
       startProcessMock
         .mockResolvedValueOnce(createMockProcess('s3fs on /data/openclaw type fuse.s3fs\n'))
-        .mockResolvedValueOnce(createMockProcess('__OK__')) // mount probe
+        .mockResolvedValueOnce(createMockProcess('__OK__')) // r2 mount probe (inside mountR2Storage)
         .mockResolvedValueOnce(createMockProcess('__OK__'))
+        .mockResolvedValueOnce(createMockProcess(''))
         .mockResolvedValueOnce(createMockProcess(''))
         .mockResolvedValueOnce(createMockProcess(''))
         .mockResolvedValueOnce(createMockProcess(''))
