@@ -21,12 +21,15 @@ CONFIG_FILE="$CONFIG_DIR/openclaw.json"
 TEMPLATE_DIR="/root/.openclaw-templates"
 TEMPLATE_FILE="$TEMPLATE_DIR/openclaw.json.template"
 BACKUP_DIR="/data/openclaw"
+WORKSPACE_DIR="/root/openclaw"
 
 echo "Config directory: $CONFIG_DIR"
 echo "Backup directory: $BACKUP_DIR"
+echo "Workspace directory: $WORKSPACE_DIR"
 
 # Create config directory
 mkdir -p "$CONFIG_DIR"
+mkdir -p "$WORKSPACE_DIR"
 
 # ============================================================
 # RESTORE FROM R2 BACKUP
@@ -92,6 +95,19 @@ elif [ -d "$BACKUP_DIR" ]; then
     echo "R2 mounted at $BACKUP_DIR but no backup data found yet"
 else
     echo "R2 not mounted, starting fresh"
+fi
+
+# Restore workspace (memory + core bootstrap files) from R2 if available (only if R2 is newer)
+# Note: OpenClaw uses `agents.defaults.workspace` (configured as /root/openclaw in our template)
+# for memory and injected bootstrap files like AGENTS.md, SOUL.md, TOOLS.md, and memory/YYYY-MM-DD.md.
+if [ -d "$BACKUP_DIR/workspace" ] && [ "$(ls -A $BACKUP_DIR/workspace 2>/dev/null)" ]; then
+    if should_restore_from_r2; then
+        echo "Restoring workspace from $BACKUP_DIR/workspace..."
+        mkdir -p "$WORKSPACE_DIR"
+        # Exclude skills/ because we restore those separately below.
+        rsync -r --no-times --delete --exclude='skills/' "$BACKUP_DIR/workspace/." "$WORKSPACE_DIR/"
+        echo "Restored workspace from R2 backup"
+    fi
 fi
 
 # Restore skills from R2 backup if available (only if R2 is newer)

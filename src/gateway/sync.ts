@@ -12,6 +12,8 @@ export interface SyncResult {
 }
 
 const DEFAULT_SYNC_TIMEOUT_MS = 10 * 60 * 1000; // 10 minutes
+const OPENCLAW_CONFIG_DIR = '/root/.openclaw';
+const OPENCLAW_WORKSPACE_DIR = '/root/openclaw';
 
 function isDebugEnabled(env: OpenClawEnv): boolean {
   return env.DEBUG_ROUTES === 'true' || env.DEV_MODE === 'true';
@@ -156,7 +158,13 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
     // Important: sandbox process status can lag behind actual completion.
     // For tiny commands like `test -f`, rely on log output instead of status.
     const verifyCmd =
-      `sh -lc 'if test -f /root/.openclaw/openclaw.json; then echo "__OK__"; else echo "__MISSING__"; fi'`;
+      `sh -lc '` +
+      // 1) config file check (existing behavior)
+      `if test -f "${OPENCLAW_CONFIG_DIR}/openclaw.json"; then echo "__OK__"; else echo "__MISSING__"; fi; ` +
+      // 2) workspace safety: avoid syncing an empty local workspace over a non-empty backup
+      `if test -d "${OPENCLAW_WORKSPACE_DIR}" && test -n "$(ls -A "${OPENCLAW_WORKSPACE_DIR}" 2>/dev/null)"; then echo "__WORKSPACE_LOCAL_NONEMPTY__"; else echo "__WORKSPACE_LOCAL_EMPTY__"; fi; ` +
+      `if test -d "${R2_MOUNT_PATH}/workspace" && test -n "$(ls -A "${R2_MOUNT_PATH}/workspace" 2>/dev/null)"; then echo "__WORKSPACE_REMOTE_NONEMPTY__"; else echo "__WORKSPACE_REMOTE_EMPTY__"; fi` +
+      `'`;
     const checkProc = await sandbox.startProcess(verifyCmd);
     debugLog(env, 'verify_started', { cmd: verifyCmd, status: checkProc.status });
 
@@ -188,6 +196,21 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
       };
     }
 
+    // If we have a non-empty workspace backup, but the local workspace is empty,
+    // abort to avoid wiping memory/bootstrap files via `--delete`.
+    if (
+      stdout.includes('__WORKSPACE_REMOTE_NONEMPTY__') &&
+      stdout.includes('__WORKSPACE_LOCAL_EMPTY__')
+    ) {
+      return {
+        success: false,
+        error: 'Sync aborted: local workspace appears empty',
+        details:
+          'The workspace directory is empty, but an existing workspace backup was found in R2. ' +
+          'Aborting to avoid overwriting memory/bootstrap files with an empty workspace.',
+      };
+    }
+
     if (!stdout.includes('__OK__')) {
       throw new Error(
         `Timed out waiting for source verification output (status=${checkProc.status}). stdout=${JSON.stringify(stdout.trim())} stderr=${JSON.stringify(stderr.trim())}`
@@ -211,8 +234,12 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
   const rsyncCommonFlags =
     `-r --no-times --delete --info=progress2 --stats --human-readable ` +
     `--exclude='*.lock' --exclude='*.log' --exclude='*.tmp'`;
-  const syncOpenclawCmd = `rsync ${rsyncCommonFlags} /root/.openclaw/ ${R2_MOUNT_PATH}/openclaw/`;
-  const syncSkillsCmd = `rsync ${rsyncCommonFlags} /root/openclaw/skills/ ${R2_MOUNT_PATH}/skills/`;
+  const syncOpenclawCmd = `rsync ${rsyncCommonFlags} ${OPENCLAW_CONFIG_DIR}/ ${R2_MOUNT_PATH}/openclaw/`;
+  // Persist OpenClaw workspace (memory + core bootstrap files) to R2.
+  // Exclude `skills/` because we sync that separately.
+  const syncWorkspaceCmd =
+    `rsync ${rsyncCommonFlags} --exclude='skills/' ${OPENCLAW_WORKSPACE_DIR}/ ${R2_MOUNT_PATH}/workspace/`;
+  const syncSkillsCmd = `rsync ${rsyncCommonFlags} ${OPENCLAW_WORKSPACE_DIR}/skills/ ${R2_MOUNT_PATH}/skills/`;
   const writeTimestampCmd = `sh -lc 'date -Iseconds > ${R2_MOUNT_PATH}/.last-sync'`;
   
   try {
@@ -239,6 +266,25 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
       status: proc.status,
       exitCode: (proc as unknown as { exitCode?: number }).exitCode,
     });
+
+    debugLog(env, 'rsync_started', { cmd: syncWorkspaceCmd });
+    const workspaceProc = await sandbox.startProcess(syncWorkspaceCmd);
+    debugLog(env, 'rsync_process', { status: workspaceProc.status });
+
+    try {
+      await waitForProcess(workspaceProc, DEFAULT_SYNC_TIMEOUT_MS);
+    } catch (e) {
+      const logs = await workspaceProc.getLogs().catch(() => ({ stdout: '', stderr: '' }));
+      debugLog(env, 'rsync_wait_error', {
+        error: e instanceof Error ? e.message : String(e),
+        status: workspaceProc.status,
+        exitCode: (workspaceProc as unknown as { exitCode?: number }).exitCode,
+        stdout: truncate((logs.stdout || '').trim(), 2000),
+        stderr: truncate((logs.stderr || '').trim(), 2000),
+      });
+      await bestEffortKill(env, workspaceProc, 'rsync_workspace_timeout');
+      throw e;
+    }
 
     debugLog(env, 'rsync_started', { cmd: syncSkillsCmd });
     const skillsProc = await sandbox.startProcess(syncSkillsCmd);
@@ -292,8 +338,9 @@ export async function syncToR2(sandbox: Sandbox, env: OpenClawEnv): Promise<Sync
         `sh -lc ` +
         `"echo '[diag] mount:' && mount | grep s3fs || true; ` +
         `echo '[diag] r2_path:' && ls -la ${R2_MOUNT_PATH} || true; ` +
-        `echo '[diag] openclaw_src:' && ls -la /root/.openclaw || true; ` +
-        `echo '[diag] skills_src:' && ls -la /root/openclaw/skills || true"`
+        `echo '[diag] openclaw_src:' && ls -la ${OPENCLAW_CONFIG_DIR} || true; ` +
+        `echo '[diag] workspace_src:' && ls -la ${OPENCLAW_WORKSPACE_DIR} || true; ` +
+        `echo '[diag] skills_src:' && ls -la ${OPENCLAW_WORKSPACE_DIR}/skills || true"`
       );
       await waitForProcess(diagProc, 5000, 200).catch(() => {});
       const diagLogs = await diagProc.getLogs().catch(() => ({ stdout: '', stderr: '' }));
